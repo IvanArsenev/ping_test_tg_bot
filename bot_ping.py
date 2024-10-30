@@ -29,8 +29,10 @@ async def create_user_list():
         async with db.execute("SELECT id FROM User") as cursor:
             users = await cursor.fetchall()
             if len(users) != 0:
-                for user_id in users[0]:
-                    user_dict[user_id] = 0
+                for user_id in users:
+                    user_dict[user_id[0]] = 0
+                    if await get_user_status(user_id[0]):
+                        asyncio.create_task(ping_servers(user_id[0]))
 
 async def init_db():
     global users
@@ -69,7 +71,6 @@ async def get_user_link_count(user_id: int):
     async with aiosqlite.connect('bot_database.db') as db:
         async with db.execute("SELECT link FROM Server WHERE user_id = ?", (user_id,)) as cursor:
             result = await cursor.fetchall()
-            print(result, len(result))
             return len(result)
 
 async def get_user_limit(user_id: int):
@@ -89,52 +90,35 @@ async def add_user_link(user_id: int, link: str, type: str):
         await db.execute("UPDATE User SET enable = ? WHERE id = ?", (True, user_id))
         await db.commit()
 
-async def ping_servers():
+async def ping_servers(user_id):
     while True:
-        async with aiosqlite.connect('bot_database.db') as db:
-            message = ""
-            async with db.execute("SELECT User.id, User.enable, User.bot_timeout, Server.link, Server.type FROM User JOIN Server ON User.id = Server.user_id WHERE Server.type = 'web'") as cursor:
-                result = await cursor.fetchall()
-                message += f"Серверы:\n"
-                for row in result:
-                    user_id, active, bot_timeout, server_link, ping_type = row
-                    if active and user_dict[user_id] != 1 and user_dict[user_id] != 2:
-                        try:
-                            response = requests.get(server_link, timeout=5).status_code
-                            if response == 200:
-                                message += f'🟢 {server_link}\n'
-                            else:
+        if await get_user_status(user_id):
+            async with aiosqlite.connect('bot_database.db') as db:
+                message = ""
+                async with db.execute(f"SELECT User.id, User.enable, User.bot_timeout, Server.link, Server.type FROM User JOIN Server ON User.id = Server.user_id WHERE Server.type = 'web' AND User.id = ?", (user_id,)) as cursor:
+                    result = await cursor.fetchall()
+                    message += "Серверы:\n"
+                    for row in result:
+                        user_id, active, bot_timeout, server_link, ping_type = row
+                        if active and user_dict[user_id] != 1 and user_dict[user_id] != 2:
+                            try:
+                                response = requests.get(server_link, timeout=5).status_code
+                                if response == 200:
+                                    message += f'🟢 {server_link}\n'
+                                else:
+                                    message += f'🔴 {server_link}\n'
+                            except:
                                 message += f'🔴 {server_link}\n'
-                        except:
-                            message += f'🔴 {server_link}\n'
-            # async with db.execute("SELECT User.id, User.enable, User.bot_timeout, Server.link, Server.type FROM User JOIN Server ON User.id = Server.user_id WHERE Server.type = 'db'") as cursor:
-            #     result = await cursor.fetchall()
-            #     message += f"Базы данных:\n"
-            #     for row in result:
-            #         user_id, active, bot_timeout, server_link, ping_type = row
-            #         if active and user_dict[user_id] != 1 and user_dict[user_id] != 2:
-
-            #             try:
-            #                 response = requests.get(server_link, timeout=5).status_code
-
-            #                 if response == 200:
-            #                     message += f'🟢 {server_link}\n'
-            #                 else:
-            #                     message += f'🔴 {server_link}\n'
-            #             except:
-            #                 message += f'🔴 {server_link}\n'
-        if user_id in last_message_id:
-            try:
-                await bot.delete_message(user_id, last_message_id[user_id])
-            except:
-                pass
-        sent_message = await bot.send_message(user_id, message, disable_web_page_preview=True)
-        last_message_id[user_id] = sent_message.message_id
-        await asyncio.sleep(int(result[0][2]))
-
-async def on_startup():
-    print("STARTED!")
-    asyncio.create_task(ping_servers())
+            if user_id in last_message_id:
+                try:
+                    await bot.delete_message(user_id, last_message_id[user_id])
+                except:
+                    pass
+            sent_message = await bot.send_message(user_id, message, disable_web_page_preview=True)
+            last_message_id[user_id] = sent_message.message_id
+            await asyncio.sleep(int(result[0][2]))
+        else:
+            break
 
 def interval_keyboard():
     buttons = [[InlineKeyboardButton(text=name, callback_data=IntervalCallback(name=name).pack())] for name in PING_INTERVALS.keys()]
@@ -194,13 +178,13 @@ async def start_ping_command(message: types.Message):
         async with aiosqlite.connect('bot_database.db') as db:
             await db.execute("UPDATE User SET enable = ? WHERE id = ?", (True, user_id))
             await db.commit()
+        asyncio.create_task(ping_servers(user_id))
         await message.answer("Пинг-тест возобновлен!")
 
 @dp.message(Command("break_ping"))
 async def break_ping_command(message: types.Message):
     user_id = message.from_user.id
     current_status = await get_user_status(user_id)
-    
     if not current_status:
         await message.answer("Пинг-тест уже приостановлен!")
     else:
@@ -240,6 +224,7 @@ async def remove_ping(callback_query: CallbackQuery):
             rowid_to_delete = rows[button_data][0]
         await db.execute("DELETE FROM Server WHERE rowid = ?", (rowid_to_delete,))
         await db.commit()
+    asyncio.create_task(ping_servers(user_id))
     await callback_query.message.answer(f"Ссылка успешно удалена!")
 
 @dp.message()
@@ -261,8 +246,6 @@ async def handle_server_link(message: types.Message):
         await message.answer("Поддержка баз данных в разработке!")
         # link = message.text.strip()
         # existing_link = await get_user_link(user_id, link)
-
-
         # if existing_link:
         #     await message.answer("Эта база данных уже добавлена.")
         # else:
@@ -273,5 +256,4 @@ async def handle_server_link(message: types.Message):
 if __name__ == "__main__":
     dp.startup.register(init_db)
     dp.startup.register(create_user_list)
-    dp.startup.register(on_startup)
     dp.run_polling(bot)
